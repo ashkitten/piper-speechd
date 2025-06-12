@@ -1,148 +1,324 @@
-#![feature(unix_mkfifo)]
+#![feature(unix_mkfifo, path_file_prefix, map_try_insert)]
 
-use std::{
-    fs::{self, File, OpenOptions, Permissions},
-    io::{BufRead, BufReader, Write},
-    os::unix::fs::{FileTypeExt, PermissionsExt, mkfifo},
-    path::PathBuf,
-};
+use std::collections::HashMap;
+use std::error::Error;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{ErrorKind, Write, stdout};
+use std::{env, panic};
+use std::{fs::OpenOptions, io::stdin};
 
-use fork::Fork;
+use libc::{F_GETFL, F_SETFL, O_NONBLOCK, STDIN_FILENO, fcntl};
+use piper_rs::ModelConfig;
 use piper_rs::synth::{AudioOutputConfig, PiperSpeechSynthesizer};
-use rodio::buffer::SamplesBuffer;
-use serde::{Deserialize, Serialize};
+use serde_ssml::SsmlElement;
 use xdg::BaseDirectories;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Data {
-    text: String,
-    model: String,
-    rate: f32,
-    pitch: f32,
-    volume: f32,
+const LOG_PATH: &'static str = concat!("/tmp/", env!("CARGO_BIN_NAME"), ".log");
+
+macro_rules! log {
+    () => {
+        writeln!(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .append(true)
+                .open(LOG_PATH)
+                .unwrap(),
+        ).unwrap()
+    };
+
+    ($($arg:tt)*) => {{
+        writeln!(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .append(true)
+                .open(LOG_PATH)
+                .unwrap(),
+            $($arg)*
+        ).unwrap()
+    }};
+}
+
+macro_rules! send {
+    () => {
+        println!()
+    };
+
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        log!("< {msg}");
+        println!("{msg}");
+    }};
+}
+
+macro_rules! recv {
+    () => {{
+        let msg = stdin().lines().next().unwrap().unwrap();
+        log!("> {msg}");
+        msg
+    }};
 }
 
 fn main() {
-    let mut args = std::env::args();
-    let _arg0 = args.next().unwrap();
+    panic::set_hook(Box::new(|info| {
+        log!("{}", info);
+    }));
 
-    let Some(data) = (|| {
-        Some(Data {
-            text: args.next()?.replace('\n', " "),
-            model: args.next()?,
-            rate: args.next()?.parse().ok()?,
-            pitch: args.next()?.parse().ok()?,
-            volume: args.next()?.parse().ok()?,
-        })
-    })() else {
-        eprintln!(
-            "usage: {} <text> <model> <rate> <pitch> <volume>",
-            env!("CARGO_BIN_NAME")
-        );
-        return;
-    };
-
-    let work_dir = BaseDirectories::new()
-        .get_runtime_directory()
-        .unwrap()
-        .join(env!("CARGO_BIN_NAME"));
-    fs::create_dir_all(&work_dir).unwrap();
-
-    let fifo = work_dir.join("input.fifo");
-    let pidfile = work_dir.join(concat!(env!("CARGO_BIN_NAME"), ".pid"));
-
-    if !fs::metadata(&fifo).is_ok_and(|metadata| metadata.file_type().is_fifo()) {
-        mkfifo(&fifo, Permissions::from_mode(0o600)).unwrap();
-    }
-
-    if !fs::read_to_string(&pidfile).is_ok_and(|s| {
-        fs::read_link(format!("/proc/{s}/exe"))
-            .is_ok_and(|c| c == fs::read_link(format!("/proc/{}/exe", std::process::id())).unwrap())
-    }) {
-        if let Ok(Fork::Child) = fork::daemon(false, true) {
-            fs::write(&pidfile, std::process::id().to_string()).unwrap();
-            start_piper(fifo);
-            return;
-        }
-    }
-
-    let mut fifo = OpenOptions::new().write(true).open(fifo).unwrap();
-    serde_json::to_writer(&mut fifo, &data).unwrap();
-    fifo.write("\n".as_bytes()).unwrap();
-}
-
-fn start_piper(fifo: PathBuf) {
     let voice_dir = BaseDirectories::new()
         .get_data_home()
         .unwrap()
         .join("piper-voices");
 
-    // open for reading and writing
-    let fifo = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(fifo)
-        .unwrap();
-    let fifo = BufReader::new(fifo);
+    let mut voices: HashMap<String, PiperSpeechSynthesizer> = HashMap::new();
 
-    let mut model = String::new();
-    let mut sample_rate = 0;
-    let mut synth = None;
-    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
-    let sink = rodio::Sink::try_new(&handle).unwrap();
+    let mut voice = {
+        let path = voice_dir
+            .read_dir()
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.path().extension() == Some(OsStr::new("json")))
+            })
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
 
-    let mut lines = fifo.lines();
-    while let Some(Ok(line)) = lines.next() {
-        let data: Data = serde_json::from_str(&line).unwrap();
+        let voice = path.file_prefix().unwrap().to_str().unwrap().to_string();
 
-        println!("got data to synthesize!:");
-        println!("{:?}", data);
+        let _ = voices.try_insert(
+            voice.clone(),
+            PiperSpeechSynthesizer::new(piper_rs::from_config_path(&path).unwrap()).unwrap(),
+        );
 
-        // make sure that the first iteration can never match the initial value of model
-        if data.model.is_empty() {
-            continue;
+        voice
+    };
+
+    let mut pitch = 1.0;
+    let mut rate = 1.0;
+    let mut volume = 1.0;
+
+    loop {
+        match recv!().as_str() {
+            "INIT" => {
+                send!("299-Everything ok so far.");
+                send!("299 OK LOADED SUCCESSFULLY");
+            }
+
+            "AUDIO" => {
+                send!("207 OK RECEIVING AUDIO SETTINGS");
+                assert_eq!(recv!(), "audio_output_method=server");
+                assert_eq!(recv!(), ".");
+                send!("203 OK AUDIO INITIALIZED");
+            }
+
+            "LOGLEVEL" => {
+                send!("207 OK RECEIVING LOGLEVEL SETTINGS");
+                // TODO: support loglevel
+                while recv!() != "." {}
+                send!("203 OK LOGLEVEL SET");
+            }
+
+            "LIST VOICES" => {
+                for entry in voice_dir.read_dir().unwrap() {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+
+                    if entry.path().extension() != Some(OsStr::new("json")) {
+                        continue;
+                    }
+
+                    let config: ModelConfig =
+                        serde_json::from_reader(File::open(entry.path()).unwrap()).unwrap();
+
+                    send!(
+                        "200-{}\t{}\t{}-{}",
+                        entry.path().file_prefix().unwrap().to_str().unwrap(),
+                        config.language.as_ref().unwrap().code,
+                        config.dataset.unwrap(),
+                        config.audio.quality.unwrap(),
+                    );
+                }
+                send!("200 OK VOICE LIST SENT");
+            }
+
+            "SET" => {
+                send!("203 OK RECEIVING SETTINGS");
+                // TODO: support settings
+                loop {
+                    let line = recv!();
+                    if line == "." {
+                        break;
+                    }
+                    let (name, value) = line.split_once('=').unwrap();
+                    match name {
+                        "pitch" => {
+                            pitch = value.parse::<f32>().unwrap() + 1.0;
+                        }
+                        "rate" => {
+                            rate = value.parse::<f32>().unwrap() / 100.0 + 1.0;
+                        }
+                        "volume" => {
+                            volume = value.parse::<f32>().unwrap() / 100.0;
+                        }
+                        "synthesis_voice" => {
+                            let path = voice_dir.join(format!("{value}.onnx.json"));
+                            if path.exists() {
+                                let _ = voices.try_insert(
+                                    value.to_string(),
+                                    PiperSpeechSynthesizer::new(
+                                        piper_rs::from_config_path(&path).unwrap(),
+                                    )
+                                    .unwrap(),
+                                );
+
+                                voice = value.to_string();
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+                send!("203 OK SETTINGS RECEIVED");
+            }
+
+            "SPEAK" => {
+                send!("202 OK RECEIVING MESSAGE");
+                let mut buf = String::new();
+                loop {
+                    let line = recv!();
+                    if line == "." {
+                        break;
+                    }
+                    buf += &line;
+                    buf += "\n";
+                }
+                let ssml = serde_ssml::from_str(buf).unwrap();
+                log!("Parsed SSML: {:#?}", ssml);
+                send!("200 OK SPEAKING");
+                send!("701 BEGIN");
+                if let Err(error) = speak(&ssml.elements, &mut voices, &voice, pitch, rate, volume)
+                {
+                    log!("Error: {:?}", error);
+                    send!("703 STOP");
+                } else {
+                    send!("702 END");
+                }
+            }
+
+            "STOP" => {}
+
+            _ => (),
         }
+    }
+}
 
-        // the compiler isn't smart enough to know that since `model` is initialized
-        // to an empty string, and we check that `data.model` isn't empty,
-        // the if condition always succeeds on the first iteration
-        if data.model != model {
-            model = data.model;
+fn speak(
+    elements: &[SsmlElement],
+    voices: &mut HashMap<String, PiperSpeechSynthesizer>,
+    voice: &str,
+    pitch: f32,
+    rate: f32,
+    volume: f32,
+) -> Result<(), Box<dyn Error>> {
+    for element in elements {
+        handle_interrupts()?;
 
-            let config_path = voice_dir.join(&format!("{model}.onnx.json"));
-            let config: piper_rs::ModelConfig =
-                serde_json::from_reader(File::open(&config_path).unwrap()).unwrap();
-            sample_rate = config.audio.sample_rate;
+        match element {
+            SsmlElement::Speak {
+                version,
+                xmlns,
+                lang,
+                children,
+            } => {
+                speak(children, voices, voice, pitch, rate, volume)?;
+            }
 
-            synth = Some(
-                PiperSpeechSynthesizer::new(piper_rs::from_config_path(&config_path).unwrap())
-                    .unwrap(),
-            );
+            SsmlElement::Text(text) => {
+                let output = voices[voice].synthesize_parallel(
+                    text.to_string(),
+                    Some(AudioOutputConfig {
+                        rate: Some(rate),
+                        volume: Some(volume),
+                        pitch: Some(pitch),
+                        appended_silence_ms: None,
+                    }),
+                )?;
+                for audio in output {
+                    handle_interrupts()?;
+
+                    let audio = audio?;
+                    send!("705-bits={}", audio.info.sample_width * 8);
+                    send!("705-num_channels={}", audio.info.num_channels);
+                    send!("705-sample_rate={}", audio.info.sample_rate);
+                    send!("705-num_samples={}", audio.samples.len());
+
+                    let mut encoded = audio.as_wave_bytes();
+                    for i in (0..encoded.len()).rev() {
+                        if encoded[i] == '\n' as u8 || encoded[i] == 0x7d {
+                            encoded[i] ^= 1 << 5;
+                            encoded.insert(i, 0x7d);
+                        }
+                    }
+
+                    print!("705-AUDIO\0");
+                    stdout().write(&encoded)?;
+                    println!();
+                    log!("< 705-AUDIO<raw audio bytes...>");
+                    send!("705 AUDIO");
+                }
+            }
+
+            SsmlElement::Mark { name } => {
+                send!("700-{}", name);
+                send!("700 INDEX MARK");
+            }
+
+            _ => unimplemented!(),
         }
+    }
+    Ok(())
+}
 
-        // safe because we always initialize synth first
-        // trust me bro
-        let synth = unsafe { synth.as_mut().unwrap_unchecked() };
+fn handle_interrupts() -> Result<(), Box<dyn Error>> {
+    let flags = unsafe { fcntl(STDIN_FILENO, F_GETFL) };
+    unsafe { fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) };
 
-        let output_config = AudioOutputConfig {
-            rate: Some(data.rate),
-            volume: Some(data.volume),
-            pitch: Some(data.pitch),
-            appended_silence_ms: Some(200),
-        };
-
-        let mut stream = synth
-            .synthesize_parallel(data.text, Some(output_config))
-            .unwrap();
-
-        let mut samples = Vec::new();
-        while let Some(Ok(audio)) = stream.next() {
-            samples.extend(audio);
+    let mut buf = String::new();
+    match stdin().read_line(&mut buf) {
+        Ok(0) => panic!("stdin closed unexpectedly"),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            // return stdin to blocking
+            unsafe { fcntl(STDIN_FILENO, F_SETFL, flags) };
+            Ok(())
         }
+        Err(e) => Err(e).unwrap(),
+        Ok(_) => {
+            assert_eq!(buf.pop(), Some('\n'));
+            log!("> {}", buf);
+            match buf.as_str() {
+                "STOP" => {
+                    // return stdin to blocking
+                    unsafe { fcntl(STDIN_FILENO, F_SETFL, flags) };
+                    Err("stop requested".into())
+                }
 
-        let buf = SamplesBuffer::new(1, sample_rate, samples);
-        sink.append(buf);
+                "PAUSE" => {
+                    // return stdin to blocking
+                    unsafe { fcntl(STDIN_FILENO, F_SETFL, flags) };
 
-        sink.sleep_until_end();
+                    match recv!().as_str() {
+                        "RESUME" => Ok(()),
+                        "STOP" => Err("stop requested".into()),
+                        _ => unimplemented!("unexpected command during pause: {:?}", buf),
+                    }
+                }
+
+                _ => unimplemented!("unexpected command during playback: {:?}", buf),
+            }
+        }
     }
 }
