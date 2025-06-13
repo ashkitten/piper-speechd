@@ -301,6 +301,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs"
 version = "0.1.9"
+source = "git+https://github.com/ashkitten/piper-rs#42e3d76fb10b7859a62476bc440f411d377529c0"
 dependencies = [
  "espeak-rs-sys",
  "ffi-support",
@@ -311,6 +312,7 @@ dependencies = [
 [[package]]
 name = "espeak-rs-sys"
 version = "0.1.9"
+source = "git+https://github.com/ashkitten/piper-rs#42e3d76fb10b7859a62476bc440f411d377529c0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -751,6 +753,7 @@ checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 [[package]]
 name = "piper-rs"
 version = "0.1.9"
+source = "git+https://github.com/ashkitten/piper-rs#42e3d76fb10b7859a62476bc440f411d377529c0"
 dependencies = [
  "espeak-rs",
  "flume",
@@ -1089,6 +1092,7 @@ dependencies = [
 [[package]]
 name = "sonic-rs-sys"
 version = "0.1.9"
+source = "git+https://github.com/ashkitten/piper-rs#42e3d76fb10b7859a62476bc440f411d377529c0"
 dependencies = [
  "bindgen",
  "cc",
